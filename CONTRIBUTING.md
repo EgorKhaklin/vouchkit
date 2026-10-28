@@ -36,6 +36,5 @@ Use your real name and a reachable email. Pull requests with unsigned commits ca
 
 ## Reporting security issues
 
-Do not open public issues for vulnerabilities — contact the maintainers privately (see the
-repository's security policy once published; until then, use the maintainer email in git
-history).
+Do not open public issues for vulnerabilities. Report them privately as described in
+[SECURITY.md](SECURITY.md).
