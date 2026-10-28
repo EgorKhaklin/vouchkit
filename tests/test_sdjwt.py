@@ -14,7 +14,7 @@ from vouchkit import (
     UnsupportedAlgorithm,
     verify_sd_jwt_vc,
 )
-from vouchkit.sdjwt import ExpiredCredential, _b64url_decode, _b64url_encode
+from vouchkit.sdjwt import ExpiredCredential, _b64url_decode, _b64url_encode, _sha256_b64url
 from vouchkit.testkit import TestHolder, TestIssuer, _b64url_json, _sign_jwt
 
 AUD = "https://rp.example"
@@ -184,3 +184,154 @@ def test_non_sdjwt_input_rejected(issued):
     with pytest.raises(SdJwtError):
         verify_sd_jwt_vc("garbage", issuer.public_jwk)
     assert _b64url_encode(b"x") == "eA"  # helper sanity
+
+
+# --- validity-controlling claims hidden in disclosures -----------------------------------
+# Reported privately against 0.0.2: exp/nbf/iss were checked on the clear payload before
+# disclosures were resolved, so an issuer that disclosed them escaped the check entirely.
+
+
+def _issue_with_disclosed(claims_clear: dict, claims_disclosed: dict, issuer: TestIssuer, holder: TestHolder):
+    """Mint a credential that (against the profile) puts `claims_disclosed` in disclosures."""
+    disclosures: dict[str, str] = {}
+    digests = []
+    for name, value in claims_disclosed.items():
+        disc = _b64url_json([_b64url_encode(b"\x00" * 16), name, value])
+        disclosures[name] = disc
+        digests.append(_sha256_b64url(disc))
+    payload = {
+        **claims_clear,
+        "cnf": {"jwk": holder.public_jwk},
+        "_sd": sorted(digests),
+        "_sd_alg": "sha-256",
+    }
+    return _sign_jwt({"alg": "ES256", "typ": "dc+sd-jwt"}, payload, issuer.key), disclosures
+
+
+def test_expired_credential_with_disclosed_exp_rejected_when_revealed():
+    issuer, holder = TestIssuer(), TestHolder()
+    issuer_jwt, disclosures = _issue_with_disclosed(
+        {"iss": issuer.issuer, "iat": 1_000, "vct": "urn:t:1", "a": 1}, {"exp": 1_010}, issuer, holder
+    )
+    presentation = holder.present(issuer_jwt, disclosures, ["exp"], aud=AUD, nonce=NONCE, now=2_000)
+    with pytest.raises(DisclosureError):
+        verify_sd_jwt_vc(presentation, issuer.public_jwk, expected_aud=AUD, expected_nonce=NONCE, now=2_000)
+
+
+def test_expired_credential_with_withheld_exp_rejected_under_require_exp():
+    issuer, holder = TestIssuer(), TestHolder()
+    issuer_jwt, disclosures = _issue_with_disclosed(
+        {"iss": issuer.issuer, "iat": 1_000, "vct": "urn:t:1", "a": 1}, {"exp": 1_010}, issuer, holder
+    )
+    presentation = holder.present(issuer_jwt, disclosures, [], aud=AUD, nonce=NONCE, now=2_000)
+    # Without the policy knob the verifier cannot tell a withheld exp from a credential issued
+    # without one; the profile leaves exp optional, so this is accepted...
+    verify_sd_jwt_vc(presentation, issuer.public_jwk, expected_aud=AUD, expected_nonce=NONCE, now=2_000)
+    # ...and a relying party that requires exp refuses it.
+    with pytest.raises(ExpiredCredential):
+        verify_sd_jwt_vc(
+            presentation, issuer.public_jwk, expected_aud=AUD, expected_nonce=NONCE, now=2_000, require_exp=True
+        )
+
+
+@pytest.mark.parametrize("name,value", [("iss", "https://evil.test"), ("nbf", 1), ("vct", "urn:x"), ("status", {})])
+def test_disclosed_registered_claim_rejected(name, value):
+    issuer, holder = TestIssuer(), TestHolder()
+    clear = {"iss": issuer.issuer, "iat": 1_000, "exp": 9_000, "vct": "urn:t:1"}
+    clear.pop(name, None)
+    issuer_jwt, disclosures = _issue_with_disclosed(clear, {name: value}, issuer, holder)
+    presentation = holder.present(issuer_jwt, disclosures, [name], aud=AUD, nonce=NONCE, now=2_000)
+    with pytest.raises(DisclosureError):
+        verify_sd_jwt_vc(presentation, issuer.public_jwk, expected_aud=AUD, expected_nonce=NONCE, now=2_000)
+
+
+@pytest.mark.parametrize("bad_exp", ["9000", True, float("nan"), float("inf"), [9000]])
+def test_non_numeric_exp_rejected(bad_exp):
+    issuer, holder = TestIssuer(), TestHolder()
+    payload = {"iss": issuer.issuer, "iat": 1_000, "exp": bad_exp, "vct": "urn:t:1", "cnf": {"jwk": holder.public_jwk}}
+    issuer_jwt = _sign_jwt({"alg": "ES256", "typ": "dc+sd-jwt"}, payload, issuer.key)
+    presentation = holder.present(issuer_jwt, {}, [], aud=AUD, nonce=NONCE, now=2_000)
+    with pytest.raises(SdJwtError):
+        verify_sd_jwt_vc(presentation, issuer.public_jwk, expected_aud=AUD, expected_nonce=NONCE, now=2_000)
+
+
+# --- crit header ---------------------------------------------------------------------------
+
+
+def test_crit_on_issuer_jwt_rejected(issued):
+    issuer, holder, _, disclosures = issued
+    issuer_jwt, disclosures = issuer.issue({"a": 1}, holder_jwk=holder.public_jwk)
+    _, payload_b64, _ = issuer_jwt.split(".")
+    import json
+
+    payload = json.loads(_b64url_decode(payload_b64))
+    forged = _sign_jwt({"alg": "ES256", "typ": "dc+sd-jwt", "crit": ["b64"], "b64": False}, payload, issuer.key)
+    presentation = holder.present(forged, disclosures, ["a"], aud=AUD, nonce=NONCE)
+    with pytest.raises(SdJwtError):
+        verify_sd_jwt_vc(presentation, issuer.public_jwk, expected_aud=AUD, expected_nonce=NONCE)
+
+
+def test_crit_on_kb_jwt_rejected(issued):
+    issuer, holder, issuer_jwt, disclosures = issued
+    chosen = [disclosures["given_name"]]
+    prefix = "~".join([issuer_jwt, *chosen]) + "~"
+    kb = _sign_jwt(
+        {"alg": "ES256", "typ": "kb+jwt", "crit": ["exp"]},
+        {"iat": 1_000, "aud": AUD, "nonce": NONCE, "sd_hash": _sha256_b64url(prefix)},
+        holder.key,
+    )
+    with pytest.raises(SdJwtError):
+        verify_sd_jwt_vc(prefix + kb, issuer.public_jwk, expected_aud=AUD, expected_nonce=NONCE, now=1_000)
+
+
+# --- KB-JWT freshness ----------------------------------------------------------------------
+
+
+def _kb(holder, issuer_jwt, disclosures, kb_claims):
+    prefix = "~".join([issuer_jwt, disclosures["given_name"]]) + "~"
+    body = {"aud": AUD, "nonce": NONCE, "sd_hash": _sha256_b64url(prefix), **kb_claims}
+    return prefix + _sign_jwt({"alg": "ES256", "typ": "kb+jwt"}, body, holder.key)
+
+
+@pytest.mark.parametrize(
+    "kb_claims",
+    [
+        {},  # iat missing
+        {"iat": float("nan")},
+        {"iat": "1000"},
+        {"iat": True},
+        {"iat": 1_000 + 61},  # future beyond skew
+        {"iat": 1_000 - 301},  # older than the default window
+        {"iat": 1_000, "exp": "2000"},
+        {"iat": 1_000, "exp": 900},  # KB-JWT itself expired
+        {"iat": 1_000, "nbf": 1_500},
+    ],
+)
+def test_kb_freshness_rejected(issued, kb_claims):
+    issuer, holder, issuer_jwt, disclosures = issued
+    with pytest.raises(InvalidKeyBinding):
+        verify_sd_jwt_vc(
+            _kb(holder, issuer_jwt, disclosures, kb_claims),
+            issuer.public_jwk,
+            expected_aud=AUD,
+            expected_nonce=NONCE,
+            now=1_000,
+        )
+
+
+def test_kb_within_window_accepted(issued):
+    issuer, holder, issuer_jwt, disclosures = issued
+    for iat in (1_000 - 300, 1_000, 1_000 + 60):
+        result = verify_sd_jwt_vc(
+            _kb(holder, issuer_jwt, disclosures, {"iat": iat, "exp": 1_001}),
+            issuer.public_jwk,
+            expected_aud=AUD,
+            expected_nonce=NONCE,
+            now=1_000,
+        )
+        assert result.key_binding_verified
+    # the window is a knob
+    verify_sd_jwt_vc(
+        _kb(holder, issuer_jwt, disclosures, {"iat": 1_000 - 600}),
+        issuer.public_jwk, expected_aud=AUD, expected_nonce=NONCE, now=1_000, kb_max_age=900,
+    )

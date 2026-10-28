@@ -20,7 +20,7 @@ from vouchkit.openid4vp import (
     UnknownTransaction,
     Verifier,
 )
-from vouchkit.sdjwt import _b64url_decode
+from vouchkit.sdjwt import ExpiredCredential, _b64url_decode
 from vouchkit.testkit import TestIssuer, TestWallet
 
 CLIENT_ID = "x509_san_dns:rp.example"
@@ -44,9 +44,9 @@ class ExplodingReceipts:
 @pytest.fixture()
 def world():
     issuer = TestIssuer()
-    wallet = TestWallet()
     receipts = RecordingReceipts()
     clock = {"now": 1_000_000.0}
+    wallet = TestWallet(clock=lambda: clock["now"])
     verifier = Verifier(
         CLIENT_ID,
         RESPONSE_URI,
@@ -193,3 +193,26 @@ def test_exploding_receipt_sink_never_breaks_verification(world):
         wallet.respond(tx.request_object, issuer_jwt, disclosures, ["given_name"])
     )
     assert credential.claims == {"given_name": "Ada"}
+
+
+def test_verifier_require_exp_reaches_the_core(world):
+    issuer, wallet, _, receipts, clock, _, _ = world
+    verifier = Verifier(
+        CLIENT_ID,
+        RESPONSE_URI,
+        trust_anchors={issuer.issuer: issuer.public_jwk},
+        receipts=receipts,
+        clock=lambda: clock["now"],
+        require_exp=True,
+    )
+    # a credential minted without exp: the opt-in policy refuses it through the transport layer
+    from vouchkit.testkit import _sign_jwt
+
+    payload = {"iss": issuer.issuer, "iat": 1_000_000, "vct": "urn:eudi:test:credential:1",
+               "cnf": {"jwk": wallet.public_jwk}, "_sd": [], "_sd_alg": "sha-256"}
+    no_exp_jwt = _sign_jwt({"alg": "ES256", "typ": "dc+sd-jwt"}, payload, issuer.key)
+    tx = verifier.start(QUERY)
+    form = wallet.respond(tx.request_object, no_exp_jwt, {}, [])
+    with pytest.raises(ExpiredCredential):
+        verifier.handle_response(form)
+    assert receipts.events[-1].outcome == "ExpiredCredential"
