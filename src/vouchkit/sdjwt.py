@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -71,6 +72,13 @@ _SD_KEY = "_sd"
 _SD_ALG_KEY = "_sd_alg"
 _ARRAY_DIGEST_KEY = "..."
 _RESERVED_CLAIMS = frozenset({_SD_KEY, _SD_ALG_KEY})
+# SD-JWT VC (draft-ietf-oauth-sd-jwt-vc, "Registered JWT Claims"): these claims MUST NOT
+# be selectively disclosable. A credential that carries one in a disclosure is malformed,
+# and a verifier that only reads the clear payload would silently skip the check it guards.
+_NEVER_DISCLOSABLE = frozenset({"iss", "nbf", "exp", "cnf", "vct", "status"})
+# Key Binding JWT freshness (RFC 9901 §7.3, step 5.5: "iat ... within an acceptable window").
+DEFAULT_KB_MAX_AGE = 300  # seconds after its iat that a KB-JWT is still accepted
+CLOCK_SKEW = 60  # seconds an iat may sit in the future before it is rejected
 
 
 def _b64url_decode(data: str) -> bytes:
@@ -118,12 +126,26 @@ def _sign_es256(signing_input: bytes, key: ec.EllipticCurvePrivateKey) -> bytes:
     return r.to_bytes(32, "big") + s.to_bytes(32, "big")
 
 
+def _numeric_date(container: dict[str, Any], name: str, exc: type[SdJwtError]) -> int:
+    """Read a NumericDate (RFC 7519 §2) claim; anything that is not a finite number is refused."""
+    value = container[name]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise exc(f"{name} must be a NumericDate")
+    return int(value)
+
+
 def _parse_jws(token: str, key: ec.EllipticCurvePublicKey, expected_typ: str | None = None) -> dict[str, Any]:
     """Parse and verify one compact JWS; returns the payload. ES256 only."""
     parts = token.split(".")
     if len(parts) != 3:
         raise SdJwtError("compact JWS must have exactly three segments")
     header = json.loads(_b64url_decode(parts[0]))
+    if not isinstance(header, dict):
+        raise SdJwtError("JWS header must be a JSON object")
+    if "crit" in header:
+        # RFC 7515 §4.1.11: a JWS whose crit lists an extension the verifier does not
+        # understand MUST be rejected. This verifier understands no extensions.
+        raise SdJwtError("crit header present; no JWS extensions are supported")
     alg = header.get("alg")
     if alg != "ES256":
         raise UnsupportedAlgorithm(f"alg {alg!r} rejected; profile requires ES256")
@@ -131,7 +153,10 @@ def _parse_jws(token: str, key: ec.EllipticCurvePublicKey, expected_typ: str | N
         raise SdJwtError(f"unexpected typ {header.get('typ')!r}; expected {expected_typ!r}")
     signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
     _verify_es256(signing_input, _b64url_decode(parts[2]), key)
-    return json.loads(_b64url_decode(parts[1]))
+    payload = json.loads(_b64url_decode(parts[1]))
+    if not isinstance(payload, dict):
+        raise SdJwtError("JWS payload must be a JSON object")
+    return payload
 
 
 @dataclass(frozen=True)
@@ -223,6 +248,8 @@ def verify_sd_jwt_vc(
     expected_aud: str | None = None,
     expected_nonce: str | None = None,
     require_key_binding: bool = True,
+    require_exp: bool = False,
+    kb_max_age: int = DEFAULT_KB_MAX_AGE,
     now: int | None = None,
 ) -> VerifiedCredential:
     """Verify an SD-JWT VC presentation string and return the disclosed claims.
@@ -231,6 +258,10 @@ def verify_sd_jwt_vc(
     the trusted issuer JWK (trust-anchor resolution lives a layer above) and, when
     key binding is required (the RP flow default), the `aud`/`nonce` it challenged
     the wallet with.
+
+    `require_exp` refuses credentials that carry no `exp` in the clear payload (a
+    relying-party policy; the profile leaves `exp` optional). `kb_max_age` is the
+    window, in seconds after its `iat`, during which a KB-JWT is accepted.
     """
     if "~" not in presentation:
         raise SdJwtError("not an SD-JWT presentation (no '~' separator)")
@@ -245,9 +276,11 @@ def verify_sd_jwt_vc(
         raise UnsupportedAlgorithm(f"_sd_alg {sd_alg!r} rejected; profile requires sha-256")
 
     ts = int(time.time()) if now is None else now
-    if "exp" in payload and ts >= int(payload["exp"]):
+    if "exp" in payload and ts >= _numeric_date(payload, "exp", ExpiredCredential):
         raise ExpiredCredential("credential is expired")
-    if "nbf" in payload and ts < int(payload["nbf"]):
+    elif "exp" not in payload and require_exp:
+        raise ExpiredCredential("credential carries no exp and one is required")
+    if "nbf" in payload and ts < _numeric_date(payload, "nbf", ExpiredCredential):
         raise ExpiredCredential("credential is not yet valid")
 
     disclosures = [_parse_disclosure(b) for b in disclosure_b64s]
@@ -264,6 +297,12 @@ def verify_sd_jwt_vc(
     if dangling:
         raise DisclosureError("disclosure(s) supplied that match no digest in the credential")
 
+    # Validity-controlling claims must sit in the clear payload, where they were checked
+    # above. One arriving through a disclosure was never checked: reject the credential.
+    smuggled = sorted(n for n in _NEVER_DISCLOSABLE if n in claims and n not in payload)
+    if smuggled:
+        raise DisclosureError(f"claim(s) {smuggled} must not be selectively disclosable")
+
     key_binding_verified = False
     if kb_jwt:
         cnf = payload.get("cnf", {})
@@ -272,6 +311,17 @@ def verify_sd_jwt_vc(
             raise InvalidKeyBinding("KB-JWT supplied but credential carries no cnf.jwk")
         holder_key = _p256_key_from_jwk(holder_jwk)
         kb_payload = _parse_jws(kb_jwt, holder_key, expected_typ="kb+jwt")
+        if "iat" not in kb_payload:
+            raise InvalidKeyBinding("KB-JWT iat missing")
+        kb_iat = _numeric_date(kb_payload, "iat", InvalidKeyBinding)
+        if kb_iat > ts + CLOCK_SKEW:
+            raise InvalidKeyBinding("KB-JWT iat is in the future")
+        if ts - kb_iat > kb_max_age:
+            raise InvalidKeyBinding("KB-JWT is older than the accepted window")
+        if "exp" in kb_payload and ts >= _numeric_date(kb_payload, "exp", InvalidKeyBinding):
+            raise InvalidKeyBinding("KB-JWT is expired")
+        if "nbf" in kb_payload and ts < _numeric_date(kb_payload, "nbf", InvalidKeyBinding):
+            raise InvalidKeyBinding("KB-JWT is not yet valid")
         if expected_aud is not None and kb_payload.get("aud") != expected_aud:
             raise InvalidKeyBinding("KB-JWT aud mismatch")
         if expected_nonce is not None and kb_payload.get("nonce") != expected_nonce:

@@ -5,7 +5,34 @@ All notable changes to vouchkit are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: minor/patch numbers may
 carry breaking changes while the API stabilizes).
 
-## [0.0.2] - Unreleased
+## [0.0.3] - Unreleased
+
+### Fixed
+
+Three verifier checks that accepted inputs the specifications call on a verifier to refuse,
+reported privately against 0.0.2 by an external researcher running public negative test
+vectors offline. None is a signature forgery; each needed a non-conforming issuer or wallet.
+
+- **Validity claims hidden in a disclosure.** `exp`, `nbf` and `iss` were read from the clear
+  issuer-signed payload before disclosures were resolved, so an issuer that placed one of
+  them in a disclosure (which the SD-JWT VC profile forbids) escaped the check entirely: an
+  expired credential with a disclosed `exp` was accepted. A credential whose `iss`, `nbf`,
+  `exp`, `cnf`, `vct` or `status` arrives through a disclosure is now rejected
+  (`DisclosureError`). New opt-in `require_exp=True` refuses credentials with no `exp` at all.
+- **`crit` header ignored.** RFC 7515 §4.1.11 requires rejecting a JWS whose `crit` names an
+  extension the verifier does not understand; vouchkit understands none, so any `crit` on the
+  issuer JWT or the KB-JWT is now rejected. A JWS header or payload that is not a JSON object
+  is rejected as well.
+- **KB-JWT `iat`/`exp` unchecked.** Key-binding freshness rested on the nonce alone. The
+  KB-JWT now needs a numeric `iat` within a window (`kb_max_age`, default 300 s, with 60 s of
+  future skew), and `exp`/`nbf` are honoured when present (RFC 9901 §7.3). `exp`/`nbf`/`iat`
+  values that are not finite numbers (strings, `NaN`, booleans) are rejected everywhere.
+
+### Changed
+
+- `TestWallet` takes a `clock` so the KB-JWT it stamps follows the verifier's clock in tests.
+
+## [0.0.2] - 2026-07-11
 
 ### Added
 

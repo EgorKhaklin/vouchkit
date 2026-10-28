@@ -44,9 +44,9 @@ class ExplodingReceipts:
 @pytest.fixture()
 def world():
     issuer = TestIssuer()
-    wallet = TestWallet()
     receipts = RecordingReceipts()
     clock = {"now": 1_000_000.0}
+    wallet = TestWallet(clock=lambda: clock["now"])
     verifier = Verifier(
         CLIENT_ID,
         RESPONSE_URI,
