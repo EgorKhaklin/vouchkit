@@ -1,6 +1,6 @@
 [project]
 name = "vouchkit"
-version = "0.0.2"
+version = "0.0.3"
 description = "The wallet-relying-party toolkit for personal-data services — verify EUDI wallet presentations (SD-JWT VC) in Python"
 readme = "README.md"
 license = { text = "Apache-2.0" }

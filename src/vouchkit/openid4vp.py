@@ -156,6 +156,9 @@ class Verifier:
         signing_key: ec.EllipticCurvePrivateKey | None = None,
         ttl_seconds: int = 300,
         clock=time.time,
+        require_exp: bool = False,
+        kb_max_age: int = 300,
+        kb_clock_skew: int = 60,
     ) -> None:
         self.client_id = client_id
         self.response_uri = response_uri
@@ -166,6 +169,9 @@ class Verifier:
         self._signing_key = signing_key
         self._ttl = ttl_seconds
         self._clock = clock
+        self._require_exp = require_exp
+        self._kb_max_age = kb_max_age
+        self._kb_clock_skew = kb_clock_skew
         self._transactions: dict[str, _Transaction] = {}
 
     # -- request side ---------------------------------------------------------
@@ -234,6 +240,9 @@ class Verifier:
                 issuer_jwk,
                 expected_aud=self.client_id,
                 expected_nonce=tx.nonce,
+                require_exp=self._require_exp,
+                kb_max_age=self._kb_max_age,
+                kb_clock_skew=self._kb_clock_skew,
                 now=int(self._clock()),
             )
         except SdJwtError as exc:
