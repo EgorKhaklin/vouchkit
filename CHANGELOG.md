@@ -5,7 +5,7 @@ All notable changes to vouchkit are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: minor/patch numbers may
 carry breaking changes while the API stabilizes).
 
-## [0.0.3] - Unreleased
+## [0.0.3] - 2026-10-28
 
 ### Fixed
 
