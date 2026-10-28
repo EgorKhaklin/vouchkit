@@ -192,7 +192,8 @@ def test_v15_header_json_array(ih):
     i, h = ih
     jwt, _ = make(i, h, BASE(i.issuer))
     _, pl, sig = jwt.split(".")
-    bad = f"{_b64url_encode(b'[\"ES256\"]')}.{pl}.{sig}"
+    header = _b64url_encode(b'["ES256"]')
+    bad = f"{header}.{pl}.{sig}"
     assert_sdjwt_error(lambda: verify(present(h, bad, []), i))
 
 
