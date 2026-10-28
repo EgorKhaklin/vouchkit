@@ -18,15 +18,24 @@ vectors offline. None is a signature forgery; each needed a non-conforming issue
   them in a disclosure (which the SD-JWT VC profile forbids) escaped the check entirely: an
   expired credential with a disclosed `exp` was accepted. A credential whose `iss`, `nbf`,
   `exp`, `cnf`, `vct` or `status` arrives through a disclosure is now rejected
-  (`DisclosureError`). New opt-in `require_exp=True` refuses credentials with no `exp` at all.
+  (`DisclosureError`). A disclosed `exp` the holder withholds cannot be told from a credential
+  issued without one, so that half stays accepted by default; the new opt-in `require_exp=True`
+  (also on `Verifier`) refuses credentials with no `exp` in the clear payload. Relying parties
+  whose issuers always set `exp` should turn it on.
 - **`crit` header ignored.** RFC 7515 §4.1.11 requires rejecting a JWS whose `crit` names an
   extension the verifier does not understand; vouchkit understands none, so any `crit` on the
   issuer JWT or the KB-JWT is now rejected. A JWS header or payload that is not a JSON object
   is rejected as well.
 - **KB-JWT `iat`/`exp` unchecked.** Key-binding freshness rested on the nonce alone. The
-  KB-JWT now needs a numeric `iat` within a window (`kb_max_age`, default 300 s, with 60 s of
-  future skew), and `exp`/`nbf` are honoured when present (RFC 9901 §7.3). `exp`/`nbf`/`iat`
-  values that are not finite numbers (strings, `NaN`, booleans) are rejected everywhere.
+  KB-JWT now needs a numeric `iat` within a window (`kb_max_age`, default 300 s, and
+  `kb_clock_skew`, default 60 s, both also on `Verifier`), and `exp`/`nbf` are honoured when
+  present (RFC 9901 §7.3). `exp`, `nbf` and `iat` in the clear issuer payload and `iat`, `exp`,
+  `nbf` on the KB-JWT must be finite numbers; strings, `NaN`, infinities and booleans are
+  rejected. Values are compared without truncation.
+- **Decode failures surfaced as the wrong exception.** A JWS header, payload or disclosure that
+  was not valid base64url JSON raised a bare `ValueError` (present since 0.0.1) instead of an
+  `SdJwtError`, so a relying party catching the documented base class could crash on a hostile
+  presentation. All three now raise `SdJwtError`/`DisclosureError`.
 
 ### Changed
 

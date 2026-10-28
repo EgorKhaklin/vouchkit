@@ -126,12 +126,26 @@ def _sign_es256(signing_input: bytes, key: ec.EllipticCurvePrivateKey) -> bytes:
     return r.to_bytes(32, "big") + s.to_bytes(32, "big")
 
 
-def _numeric_date(container: dict[str, Any], name: str, exc: type[SdJwtError]) -> int:
-    """Read a NumericDate (RFC 7519 §2) claim; anything that is not a finite number is refused."""
+def _json_segment(b64: str, exc: type[SdJwtError]) -> Any:
+    """Decode one base64url JSON segment; every decode failure surfaces as `exc`."""
+    try:
+        return json.loads(_b64url_decode(b64))
+    except (ValueError, RecursionError) as err:  # binascii, UTF-8 and JSON errors are ValueErrors
+        raise exc("segment is not valid base64url JSON") from err
+
+
+def _numeric_date(container: dict[str, Any], name: str, exc: type[SdJwtError]) -> int | float:
+    """Read a NumericDate (RFC 7519 §2) claim; anything that is not a finite number is refused.
+
+    The value is returned as is: truncating would accept a fractional `nbf`/`iat` early and
+    expire a fractional `exp` early, and `math.isfinite` on a huge int would raise.
+    """
     value = container[name]
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise exc(f"{name} must be a NumericDate")
-    return int(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        raise exc(f"{name} must be a NumericDate")
+    return value
 
 
 def _parse_jws(token: str, key: ec.EllipticCurvePublicKey, expected_typ: str | None = None) -> dict[str, Any]:
@@ -139,7 +153,7 @@ def _parse_jws(token: str, key: ec.EllipticCurvePublicKey, expected_typ: str | N
     parts = token.split(".")
     if len(parts) != 3:
         raise SdJwtError("compact JWS must have exactly three segments")
-    header = json.loads(_b64url_decode(parts[0]))
+    header = _json_segment(parts[0], SdJwtError)
     if not isinstance(header, dict):
         raise SdJwtError("JWS header must be a JSON object")
     if "crit" in header:
@@ -153,7 +167,7 @@ def _parse_jws(token: str, key: ec.EllipticCurvePublicKey, expected_typ: str | N
         raise SdJwtError(f"unexpected typ {header.get('typ')!r}; expected {expected_typ!r}")
     signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
     _verify_es256(signing_input, _b64url_decode(parts[2]), key)
-    payload = json.loads(_b64url_decode(parts[1]))
+    payload = _json_segment(parts[1], SdJwtError)
     if not isinstance(payload, dict):
         raise SdJwtError("JWS payload must be a JSON object")
     return payload
@@ -169,7 +183,7 @@ class _Disclosure:
 
 
 def _parse_disclosure(b64: str) -> _Disclosure:
-    decoded = json.loads(_b64url_decode(b64))
+    decoded = _json_segment(b64, DisclosureError)
     if not isinstance(decoded, list) or len(decoded) not in (2, 3):
         raise DisclosureError("disclosure must be a JSON array of 2 or 3 elements")
     if len(decoded) == 3:
@@ -250,6 +264,7 @@ def verify_sd_jwt_vc(
     require_key_binding: bool = True,
     require_exp: bool = False,
     kb_max_age: int = DEFAULT_KB_MAX_AGE,
+    kb_clock_skew: int = CLOCK_SKEW,
     now: int | None = None,
 ) -> VerifiedCredential:
     """Verify an SD-JWT VC presentation string and return the disclosed claims.
@@ -261,7 +276,8 @@ def verify_sd_jwt_vc(
 
     `require_exp` refuses credentials that carry no `exp` in the clear payload (a
     relying-party policy; the profile leaves `exp` optional). `kb_max_age` is the
-    window, in seconds after its `iat`, during which a KB-JWT is accepted.
+    window, in seconds after its `iat`, during which a KB-JWT is accepted, and
+    `kb_clock_skew` how far in the future that `iat` may sit.
     """
     if "~" not in presentation:
         raise SdJwtError("not an SD-JWT presentation (no '~' separator)")
@@ -282,6 +298,8 @@ def verify_sd_jwt_vc(
         raise ExpiredCredential("credential carries no exp and one is required")
     if "nbf" in payload and ts < _numeric_date(payload, "nbf", ExpiredCredential):
         raise ExpiredCredential("credential is not yet valid")
+    if "iat" in payload:
+        _numeric_date(payload, "iat", SdJwtError)  # not a validity check; refuse garbage early
 
     disclosures = [_parse_disclosure(b) for b in disclosure_b64s]
     by_digest: dict[str, _Disclosure] = {}
@@ -314,7 +332,7 @@ def verify_sd_jwt_vc(
         if "iat" not in kb_payload:
             raise InvalidKeyBinding("KB-JWT iat missing")
         kb_iat = _numeric_date(kb_payload, "iat", InvalidKeyBinding)
-        if kb_iat > ts + CLOCK_SKEW:
+        if kb_iat > ts + kb_clock_skew:
             raise InvalidKeyBinding("KB-JWT iat is in the future")
         if ts - kb_iat > kb_max_age:
             raise InvalidKeyBinding("KB-JWT is older than the accepted window")
