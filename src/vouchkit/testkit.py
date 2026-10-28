@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import secrets
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -139,6 +140,7 @@ class TestWallet:
     __test__ = False  # public test-kit API, not a pytest collectable
 
     holder: TestHolder = None  # type: ignore[assignment]
+    clock: Callable[[], float] = time.time  # stamps the KB-JWT iat; align it with the verifier's
 
     def __post_init__(self) -> None:
         if self.holder is None:
@@ -162,6 +164,7 @@ class TestWallet:
             reveal,
             aud=request_object["client_id"],
             nonce=request_object["nonce"],
+            now=int(self.clock()),
         )
         return {
             "vp_token": json.dumps({query_id: [presentation]}),
