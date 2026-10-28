@@ -5,7 +5,43 @@ All notable changes to vouchkit are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (pre-1.0: minor/patch numbers may
 carry breaking changes while the API stabilizes).
 
-## [0.0.2] - Unreleased
+## [0.0.3] - Unreleased
+
+### Fixed
+
+Three verifier checks that accepted inputs the specifications call on a verifier to refuse,
+reported privately against 0.0.2 by an external researcher running public negative test
+vectors offline. None is a signature forgery; each needed a non-conforming issuer or wallet.
+
+- **Validity claims hidden in a disclosure.** `exp`, `nbf` and `iss` were read from the clear
+  issuer-signed payload before disclosures were resolved, so an issuer that placed one of
+  them in a disclosure (which the SD-JWT VC profile forbids) escaped the check entirely: an
+  expired credential with a disclosed `exp` was accepted. A credential whose `iss`, `nbf`,
+  `exp`, `cnf`, `vct` or `status` arrives through a disclosure is now rejected
+  (`DisclosureError`). A disclosed `exp` the holder withholds cannot be told from a credential
+  issued without one, so that half stays accepted by default; the new opt-in `require_exp=True`
+  (also on `Verifier`) refuses credentials with no `exp` in the clear payload. Relying parties
+  whose issuers always set `exp` should turn it on.
+- **`crit` header ignored.** RFC 7515 §4.1.11 requires rejecting a JWS whose `crit` names an
+  extension the verifier does not understand; vouchkit understands none, so any `crit` on the
+  issuer JWT or the KB-JWT is now rejected. A JWS header or payload that is not a JSON object
+  is rejected as well.
+- **KB-JWT `iat`/`exp` unchecked.** Key-binding freshness rested on the nonce alone. The
+  KB-JWT now needs a numeric `iat` within a window (`kb_max_age`, default 300 s, and
+  `kb_clock_skew`, default 60 s, both also on `Verifier`), and `exp`/`nbf` are honoured when
+  present (RFC 9901 §7.3). `exp`, `nbf` and `iat` in the clear issuer payload and `iat`, `exp`,
+  `nbf` on the KB-JWT must be finite numbers; strings, `NaN`, infinities and booleans are
+  rejected. Values are compared without truncation.
+- **Decode failures surfaced as the wrong exception.** A JWS header, payload or disclosure that
+  was not valid base64url JSON raised a bare `ValueError` (present since 0.0.1) instead of an
+  `SdJwtError`, so a relying party catching the documented base class could crash on a hostile
+  presentation. All three now raise `SdJwtError`/`DisclosureError`.
+
+### Changed
+
+- `TestWallet` takes a `clock` so the KB-JWT it stamps follows the verifier's clock in tests.
+
+## [0.0.2] - 2026-07-11
 
 ### Added
 
